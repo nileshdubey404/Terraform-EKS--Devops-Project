@@ -1,0 +1,326 @@
+// Jenkins pipeline: build -> push to ECR -> deploy to EKS with Helm.
+//
+// Jenkins job settings:
+//   Definition   : Pipeline script from SCM
+//   Script Path  : helm-k8s-deployment/Jenkinsfile   (repo root contains both
+//                  helm-k8s-deployment/ and terraform-infra/)
+//
+// Credentials: none stored in Jenkins. AWS access comes from the EC2 instance
+// profile created by Terraform (modules/iam).
+
+pipeline {
+    agent any
+
+    options {
+        timestamps()
+        disableConcurrentBuilds()
+        skipDefaultCheckout(true)
+        timeout(time: 30, unit: 'MINUTES')
+        buildDiscarder(logRotator(numToKeepStr: '20', artifactNumToKeepStr: '5'))
+    }
+
+    // Only static values live here. Values discovered at run time
+    // (account id, image tag, VPC id, ...) are set in the 'Prepare' stage.
+    environment {
+        AWS_REGION        = 'ap-south-1'
+        AWS_DEFAULT_REGION = 'ap-south-1'
+        EKS_CLUSTER       = 'demo-eks-cluster'      // keep in sync with Terraform var.cluster_name
+        ECR_REPOSITORY    = 'ecommerce-app-dev-frontend'
+
+        K8S_NAMESPACE     = 'development'
+        APP_RELEASE       = 'frontend'
+
+        LBC_RELEASE       = 'aws-load-balancer-controller'
+        LBC_CHART_VERSION = '1.14.0'
+
+        // Isolated per-build kube config so builds never share credentials.
+        KUBECONFIG        = "${WORKSPACE}/.kube/config"
+        // Isolated docker config so 'docker login' tokens are not left behind.
+        DOCKER_CONFIG     = "${WORKSPACE}/.docker"
+        HELM_CACHE_HOME   = "${WORKSPACE}/.helm/cache"
+        HELM_CONFIG_HOME  = "${WORKSPACE}/.helm/config"
+        HELM_DATA_HOME    = "${WORKSPACE}/.helm/data"
+    }
+
+    stages {
+
+        stage('Checkout') {
+            steps {
+                checkout scm
+            }
+        }
+
+        stage('Prepare: Tools, AWS Access, Metadata') {
+            steps {
+                sh '''
+                    set -eu
+                    for tool in aws kubectl helm docker git; do
+                        command -v "$tool" >/dev/null || { echo "Missing tool: $tool"; exit 1; }
+                    done
+
+                    aws --version
+                    kubectl version --client
+                    helm version --short
+                    docker --version
+
+                    aws sts get-caller-identity
+                '''
+
+                script {
+                    env.ACCOUNT_ID = sh(
+                        script: 'aws sts get-caller-identity --query Account --output text',
+                        returnStdout: true
+                    ).trim()
+
+                    env.ECR_REGISTRY = "${env.ACCOUNT_ID}.dkr.ecr.${env.AWS_REGION}.amazonaws.com"
+                    env.ECR_URI      = "${env.ECR_REGISTRY}/${env.ECR_REPOSITORY}"
+
+                    def shortCommit = sh(
+                        script: 'git rev-parse --short=7 HEAD',
+                        returnStdout: true
+                    ).trim()
+                    env.IMAGE_TAG = "${env.BUILD_NUMBER}-${shortCommit}"
+
+                    // Do not wrap this in try/catch: if the sh step fails, its own
+                    // AWS error (AccessDenied, ResourceNotFound, ...) is the useful message.
+                    env.VPC_ID = sh(
+                        script: '''
+                            aws eks describe-cluster \
+                              --name "$EKS_CLUSTER" \
+                              --region "$AWS_REGION" \
+                              --query 'cluster.resourcesVpcConfig.vpcId' \
+                              --output text
+                        ''',
+                        returnStdout: true
+                    ).trim()
+
+                    if (!env.VPC_ID || env.VPC_ID == 'None') {
+                        error('EKS returned an empty VPC ID.')
+                    }
+
+                    echo "AWS Account : ${env.ACCOUNT_ID}"
+                    echo "EKS Cluster : ${env.EKS_CLUSTER}"
+                    echo "ECR URI     : ${env.ECR_URI}"
+                    echo "Image Tag   : ${env.IMAGE_TAG}"
+                    echo "VPC ID      : ${env.VPC_ID}"
+                }
+
+                // Needs ecr:DescribeRepositories (granted in terraform modules/iam).
+                sh '''
+                    set -eu
+                    aws ecr describe-repositories \
+                      --repository-names "$ECR_REPOSITORY" \
+                      --region "$AWS_REGION" >/dev/null
+
+                    # Image tags are IMMUTABLE in ECR; fail early with a clear
+                    # message instead of failing at 'docker push'.
+                    if aws ecr describe-images \
+                         --repository-name "$ECR_REPOSITORY" \
+                         --image-ids imageTag="$IMAGE_TAG" \
+                         --region "$AWS_REGION" >/dev/null 2>&1; then
+                        echo "Image tag $IMAGE_TAG already exists in ECR."
+                        exit 1
+                    fi
+
+                    # Kubeconfig for kubectl/helm (uses the instance role).
+                    mkdir -p "$(dirname "$KUBECONFIG")"
+                    aws eks update-kubeconfig \
+                      --name "$EKS_CLUSTER" \
+                      --region "$AWS_REGION" \
+                      --kubeconfig "$KUBECONFIG"
+
+                    kubectl cluster-info
+                '''
+            }
+        }
+
+        stage('Lint Helm Chart') {
+            steps {
+                dir('helm-k8s-deployment') {
+                    sh '''
+                        set -eu
+                        helm lint ./charts/frontend-chart \
+                          --values ./charts/frontend-chart/values-dev.yaml \
+                          --set-string image.repository="$ECR_URI" \
+                          --set-string image.tag="$IMAGE_TAG"
+                    '''
+                }
+            }
+        }
+
+        stage('Build and Push Frontend Image') {
+            steps {
+                sh '''
+                    set -eu
+                    mkdir -p "$DOCKER_CONFIG"
+
+                    aws ecr get-login-password --region "$AWS_REGION" |
+                      docker login --username AWS --password-stdin "$ECR_REGISTRY"
+                '''
+
+                dir('helm-k8s-deployment') {
+                    sh '''
+                        set -eu
+
+                        docker build \
+                          --pull \
+                          --tag "$ECR_URI:$IMAGE_TAG" \
+                          --label "org.opencontainers.image.revision=$(git rev-parse HEAD)" \
+                          --label "org.opencontainers.image.version=$IMAGE_TAG" \
+                          .
+
+                        docker push "$ECR_URI:$IMAGE_TAG"
+                    '''
+                }
+            }
+        }
+
+        stage('Install AWS Load Balancer Controller') {
+            steps {
+                sh '''
+                    set -eu
+
+                    helm repo add eks https://aws.github.io/eks-charts --force-update
+                    helm repo update eks
+
+                    helm upgrade --install "$LBC_RELEASE" \
+                      eks/aws-load-balancer-controller \
+                      --namespace kube-system \
+                      --version "$LBC_CHART_VERSION" \
+                      --set clusterName="$EKS_CLUSTER" \
+                      --set region="$AWS_REGION" \
+                      --set vpcId="$VPC_ID" \
+                      --set serviceAccount.create=true \
+                      --set serviceAccount.name=aws-load-balancer-controller \
+                      --wait \
+                      --atomic \
+                      --timeout 5m
+                '''
+            }
+        }
+
+        stage('Verify AWS Load Balancer Controller') {
+            steps {
+                sh '''
+                    set -eu
+
+                    kubectl rollout status \
+                      deployment/aws-load-balancer-controller \
+                      --namespace kube-system \
+                      --timeout=180s
+
+                    kubectl get deployment aws-load-balancer-controller --namespace kube-system
+                '''
+            }
+        }
+
+        stage('Deploy Frontend Helm Chart') {
+            steps {
+                dir('helm-k8s-deployment') {
+                    sh '''
+                        set -eu
+
+                        helm upgrade --install "$APP_RELEASE" \
+                          ./charts/frontend-chart \
+                          --namespace "$K8S_NAMESPACE" \
+                          --create-namespace \
+                          --values ./charts/frontend-chart/values-dev.yaml \
+                          --set-string image.repository="$ECR_URI" \
+                          --set-string image.tag="$IMAGE_TAG" \
+                          --wait \
+                          --atomic \
+                          --timeout 5m
+                    '''
+                }
+            }
+        }
+
+        stage('Verify Frontend Deployment') {
+            steps {
+                sh '''
+                    set -eu
+
+                    kubectl rollout status \
+                      "deployment/$APP_RELEASE" \
+                      --namespace "$K8S_NAMESPACE" \
+                      --timeout=180s
+
+                    kubectl get deployments,pods,services,ingress \
+                      --namespace "$K8S_NAMESPACE"
+                '''
+            }
+        }
+
+        stage('Verify ALB Provisioning') {
+            steps {
+                sh '''
+                    set -eu
+
+                    # Ingress name is "<release>-ingress" (see chart templates/ingress.yaml).
+                    INGRESS="${APP_RELEASE}-ingress"
+                    ALB_DNS=""
+
+                    for attempt in $(seq 1 30); do
+                        ALB_DNS=$(kubectl get ingress "$INGRESS" \
+                          --namespace "$K8S_NAMESPACE" \
+                          --output jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+
+                        [ -n "$ALB_DNS" ] && break
+
+                        echo "ALB not assigned yet ($attempt/30)."
+                        sleep 10
+                    done
+
+                    if [ -z "$ALB_DNS" ]; then
+                        echo "Ingress has no ALB hostname."
+                        kubectl describe ingress "$INGRESS" --namespace "$K8S_NAMESPACE"
+                        kubectl logs deployment/aws-load-balancer-controller \
+                          --namespace kube-system --tail=100
+                        exit 1
+                    fi
+
+                    echo "ALB hostname: $ALB_DNS"
+
+                    # The ALB DNS name resolves before targets are healthy, so
+                    # poll the HTTP endpoint as the final smoke test.
+                    for attempt in $(seq 1 30); do
+                        code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "http://$ALB_DNS/" || true)
+                        if [ "$code" = "200" ]; then
+                            echo "Smoke test passed (HTTP 200)."
+                            exit 0
+                        fi
+                        echo "Waiting for ALB targets to become healthy (HTTP $code, $attempt/30)."
+                        sleep 10
+                    done
+
+                    echo "Smoke test failed: ALB did not return HTTP 200."
+                    exit 1
+                '''
+            }
+        }
+    }
+
+    post {
+        success {
+            echo 'CI/CD pipeline completed successfully.'
+        }
+
+        failure {
+            echo 'Pipeline failed. Review the first failed stage and its logs.'
+            echo 'Helm upgrades use --atomic, so a failed release is rolled back automatically.'
+        }
+
+        always {
+            // Never let cleanup fail the build.
+            sh '''
+                if [ -n "${ECR_URI:-}" ] && [ -n "${IMAGE_TAG:-}" ]; then
+                    docker image rm "$ECR_URI:$IMAGE_TAG" || true
+                fi
+                docker logout "${ECR_REGISTRY:-}" || true
+                docker image prune -f || true
+            '''
+
+            cleanWs(deleteDirs: true, disableDeferredWipeout: true)
+        }
+    }
+}

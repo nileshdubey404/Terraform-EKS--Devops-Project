@@ -1,0 +1,2 @@
+# Development overrides. image.repository / image.tag are injected by Jenkins.
+replicaCount: 2

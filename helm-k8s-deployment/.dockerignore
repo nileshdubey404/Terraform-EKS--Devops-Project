@@ -1,0 +1,31 @@
+# VCS
+.git
+.gitignore
+
+# Dependencies and build output (installed/built inside the image)
+node_modules
+dist
+build
+.pnpm-store/
+
+# Logs
+*.log
+npm-debug.log*
+
+# Secrets
+.env
+.env.*
+*.pem
+*.key
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+
+# Not needed in the image
+Dockerfile
+.dockerignore
+Jenkinsfile
+charts/
+README.md
