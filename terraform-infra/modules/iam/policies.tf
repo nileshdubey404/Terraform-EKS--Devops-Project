@@ -29,6 +29,7 @@ resource "aws_iam_policy" "jenkins_ecr_policy" {
 
         Action = [
           "ecr:BatchCheckLayerAvailability",
+          "ecr:BatchGetImage",
           "ecr:CompleteLayerUpload",
           "ecr:DescribeImages",
           "ecr:DescribeRepositories",
